@@ -1,5 +1,7 @@
 # Travel Booking Warehouse
 
+[![tests](https://github.com/hunterhope123/travel-booking-warehouse/actions/workflows/tests.yml/badge.svg)](https://github.com/hunterhope123/travel-booking-warehouse/actions/workflows/tests.yml)
+
 A dimensional data warehouse for an online travel agency where users search for and book flights, hotels and rental cars, with or without an account. The goal is customer intelligence: conversion funnels, unmet demand, and growth by business line.
 
 **Stack:** SQL (ANSI-style, tested on DuckDB; ports to Snowflake or Databricks), Python test harness.
@@ -21,6 +23,7 @@ pytest -q                     # same checks as assertions
 | `sql/02_analytics_queries.sql` | Conversion funnel and unmet-demand queries |
 | `sql/03_booking_growth_yoy.sql` | YoY booking growth by year and business line |
 | `test_warehouse.py` | Builds everything in DuckDB on synthetic data and validates the results |
+| `.github/workflows/tests.yml` | Runs the tests on every push (GitHub Actions) |
 
 ## Data model and key design decisions
 
@@ -91,6 +94,18 @@ Definition choices, each documented in the file:
 - A year x line spine means a year with zero bookings doesn't make `LAG` compare against the wrong year.
 
 The query also returns value (USD) growth.
+
+### Sample output (synthetic data)
+
+`python test_warehouse.py` loads 4 years of synthetic data (about 3,800 booked items and 40,000 searches). The data was generated with fixed growth rates, so the query can be checked against a known answer:
+
+| Business line | 2024 | 2025 | 2026 | Rate built into the data |
+|---|---|---|---|---|
+| Hotel | +31.6% | +38.0% | +32.9% | +35%/yr |
+| Flight | +15.9% | +24.3% | +19.8% | +20%/yr |
+| Car | -8.7% | -13.5% | -7.3% | -10%/yr |
+
+The test asserts this ordering (Hotel > Flight > 0 > Car) and that each line's first year has no growth value. Net bookings are lower than gross because about 8% of items are cancelled.
 
 ## Scaling: what breaks first if bookings spike overnight?
 

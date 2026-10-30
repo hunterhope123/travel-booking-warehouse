@@ -103,11 +103,13 @@ def build(con: duckdb.DuckDBPyConnection, seed: int = 7) -> None:
                     s = searches[-1]
                     amt = round(rnd.uniform(80, 900), 2)
                     status = "Cancelled" if rnd.random() < 0.08 else "Confirmed"
-                    items.append((f"BI{bid}", f"B{bid}", s[0], max(s[2], 1), line, s[4], s[5], s[6], s[7],
+                    # an anonymous searcher who books checks out as a guest
+                    cust_key = s[2] if s[2] > 0 else 251 + bid % 150
+                    items.append((f"BI{bid}", f"B{bid}", s[0], cust_key, line, s[4], s[5], s[6], s[7],
                                   s[11], s[12], s[8], s[9],
                                   rnd.choice([1, 2, 3]) if line == 1 else -1,
                                   rnd.choice([1, 2, 3]) if line == 2 else -1,
-                                  s[10], s[2] > 250, s[15], s[16], 4, amt, round(amt * 0.1, 2),
+                                  s[10], cust_key > 250, s[15], s[16], 4, amt, round(amt * 0.1, 2),
                                   round(amt * 1.1, 2), status, None, datetime.now()))
     import pandas as pd
     search_df = pd.DataFrame(searches)
@@ -122,7 +124,7 @@ def run_file(con, name):
     return [con.execute(s).fetchdf() for s in split_sql((HERE / name).read_text())]
 
 
-def test_part1():
+def test_warehouse_queries():
     con = duckdb.connect()
     build(con)
     a, b = run_file(con, "02_analytics_queries.sql")
@@ -132,6 +134,12 @@ def test_part1():
     assert set(g["business_line"]) == {"Flight", "Hotel", "Car"}
     # first year has no growth, later years do
     assert g.groupby("business_line")["booking_growth_pct"].apply(lambda s: s.isna().sum()).eq(1).all()
+    # the synthetic data grows Hotel ~35%/yr, Flight ~20%/yr and shrinks Car ~10%/yr;
+    # the query should recover that ordering
+    avg = g.groupby("business_line")["booking_growth_pct"].mean()
+    assert avg["Hotel"] > avg["Flight"] > 0 > avg["Car"]
+    # no anonymous (-1) customer on a booking: anonymous searchers check out as guests
+    assert con.execute("SELECT COUNT(*) FROM fact_booking_item WHERE customer_key = -1").fetchone()[0] == 0
 
 
 if __name__ == "__main__":
@@ -143,5 +151,5 @@ if __name__ == "__main__":
     print("Q2-A conversion funnel (first 12 rows)\n", a.head(12), "\n")
     print("Q2-B unmet demand\n", b, "\n")
     print("Q3 YoY growth\n", run_file(con, "03_booking_growth_yoy.sql")[0])
-    test_part1()
+    test_warehouse_queries()
     print("\nAll warehouse checks passed.")
