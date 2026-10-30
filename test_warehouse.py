@@ -128,7 +128,13 @@ def test_warehouse_queries():
     con = duckdb.connect()
     build(con)
     a, b = run_file(con, "02_analytics_queries.sql")
-    assert len(a) > 0 and (a["search_conversion_pct"] >= 0).all() and a["booked_items"].sum() > 0
+    assert len(a) > 0 and a["booked_items"].sum() > 0
+    assert a["search_conversion_pct"].between(0, 100).all()
+    assert (a["converted_searches"] <= a["searches"]).all()
+    # every search that led to a net booking is counted once, in its search month
+    expected = con.execute("""SELECT COUNT(DISTINCT search_id) FROM fact_booking_item
+                              WHERE booking_status <> 'Cancelled' AND search_id IS NOT NULL""").fetchone()[0]
+    assert a["converted_searches"].sum() == expected
     assert len(b) > 0
     (g,) = run_file(con, "03_booking_growth_yoy.sql")
     assert set(g["business_line"]) == {"Flight", "Hotel", "Car"}
