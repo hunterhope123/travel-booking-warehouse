@@ -120,8 +120,19 @@ def build(con: duckdb.DuckDBPyConnection, seed: int = 7) -> None:
     con.execute("INSERT INTO fact_booking_item SELECT * FROM items_df")
 
 
+def _fetch(con, sql):
+    # DuckDB returns SUM() of integers as a 128-bit HUGEINT, which pandas turns into
+    # floats (4.0). Cast those back to whole numbers so output matches Databricks.
+    rel = con.sql(sql)
+    df = rel.df()
+    for name, dtype in zip(rel.columns, rel.dtypes):
+        if str(dtype) == "HUGEINT":
+            df[name] = df[name].astype("Int64")
+    return df
+
+
 def run_file(con, name):
-    return [con.execute(s).fetchdf() for s in split_sql((HERE / name).read_text())]
+    return [_fetch(con, s) for s in split_sql((HERE / name).read_text())]
 
 
 def test_warehouse_queries():
@@ -129,13 +140,14 @@ def test_warehouse_queries():
     build(con)
     a, b = run_file(con, "02_analytics_queries.sql")
     assert len(a) > 0 and a["booked_items"].sum() > 0
-    assert a["search_conversion_pct"].between(0, 100).all()
+    assert a["conversion_pct"].between(0, 100).all()
     assert (a["converted_searches"] <= a["searches"]).all()
     # every search that led to a net booking is counted once, in its search month
     expected = con.execute("""SELECT COUNT(DISTINCT search_id) FROM fact_booking_item
-                              WHERE booking_status <> 'Cancelled' AND search_id IS NOT NULL""").fetchone()[0]
+                              WHERE booking_status <> 'Cancelled' AND search_id IS NOT NULL""").fetchall()[0][0]
     assert a["converted_searches"].sum() == expected
-    assert len(b) > 0
+    assert len(b) > 0 and b["conversion_pct"].between(0, 100).all()
+    assert (b["converted_searches"] + b["unconverted_searches"] == b["searches"]).all()
     (g,) = run_file(con, "03_booking_growth_yoy.sql")
     assert set(g["business_line"]) == {"Flight", "Hotel", "Car"}
     # first year has no growth, later years do
@@ -145,7 +157,7 @@ def test_warehouse_queries():
     avg = g.groupby("business_line")["booking_growth_pct"].mean()
     assert avg["Hotel"] > avg["Flight"] > 0 > avg["Car"]
     # no anonymous (-1) customer on a booking: anonymous searchers check out as guests
-    assert con.execute("SELECT COUNT(*) FROM fact_booking_item WHERE customer_key = -1").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM fact_booking_item WHERE customer_key = -1").fetchall()[0][0] == 0
 
 
 if __name__ == "__main__":
