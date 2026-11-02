@@ -72,7 +72,7 @@ erDiagram
 Both are in [`sql/02_analytics_queries.sql`](sql/02_analytics_queries.sql) and were tested against synthetic data.
 
 - **A. Search-to-booking conversion by business line and month, registered vs. guest.** Conversion is the core health metric for a travel site. Each booking is credited to the search that produced it (`search_id`), and both are grouped by the search date, so a September search that books in October is a September conversion. A search counts as converted once, however many items it led to. The query shows which line loses the most demand, and whether registered users convert better than guests.
-- **B. Unmet demand by destination.** This finds destinations with many searches but low conversion. Unconverted searches are an estimate of unmet demand, not proof of missing supply: price, sold-out dates, abandoned sessions and bookings made elsewhere all lower conversion. It shows where to look first for inventory, partner or pricing gaps.
+- **B. Unmet demand by destination.** This finds destinations with many searches but low conversion, counted per search the same way as Query A (a search in the window converts if it led to a non-cancelled booking). On the dummy data, hotels in Washington, Orlando and Chicago lead: about 3,800 searches each, with 8.5-8.8% converting. Unconverted searches are an estimate of unmet demand, not proof of missing supply: price, sold-out dates, abandoned sessions and bookings made elsewhere all lower conversion. It shows where to look first for inventory, partner or pricing gaps.
 
 ## Year-over-year booking growth by business line
 
