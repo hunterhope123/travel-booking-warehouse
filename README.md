@@ -4,7 +4,7 @@
 
 A dimensional data warehouse for an online travel agency where users search for and book flights, hotels and rental cars, with or without an account. The goal is customer intelligence: conversion funnels, unmet demand, and growth by business line.
 
-**Stack:** SQL (ANSI-style, tested on DuckDB; ports to Snowflake or Databricks), Python test harness.
+**Stack:** SQL and Python. Databricks (Delta Lake, Unity Catalog) is the target platform and my main stack. Everything here runs and is tested locally in DuckDB on dummy data, so anyone can run it on a laptop without a cloud workspace; the SQL patterns (star schema, CTEs, window functions, `QUALIFY`) carry over to Databricks SQL. The DDL notes what changes on Delta.
 
 ## Run it
 
@@ -62,7 +62,7 @@ erDiagram
 
 1. **Searches and bookings are separate facts.** They happen at different grains and volumes (searches outnumber bookings 10-20x). Keeping them apart keeps each fact clean, and `search_id` on the booking links them for funnel analysis.
 2. **One search fact for all three lines, not three.** Flights, hotels and cars share most attributes: who, when, where, how many people. Line-specific fields are nullable, or point at a `-1` "Not applicable" dimension member, so fact keys are never NULL. Conversion and funnel questions across lines then become one query instead of a three-way UNION.
-3. **Guests are first-class customers.** Booking doesn't require registration, so `dim_customer` holds guests keyed on a hashed email, which keeps raw PII out of the warehouse. A guest who books twice is still one customer, and SCD2 keeps history when that guest later registers. Searches with no identity map to the `-1` Anonymous member.
+3. **Guests are first-class customers.** Booking doesn't require registration, so `dim_customer` holds guests keyed on a token of their email: a keyed HMAC (secret held outside the warehouse) or a tokenization service. A plain hash is not enough, because emails are guessable. This keeps raw PII out of the warehouse; matching only works when an email or other reliable identifier was captured. A guest who books twice is still one customer, and SCD2 keeps history when that guest later registers. Searches with no identity map to the `-1` Anonymous member.
 4. **Booking-item grain with `booking_id` as a degenerate dimension.** A trip with a flight and a hotel is two rows. That gives correct per-line counts and revenue (what the growth query needs) without double counting the cart.
 5. **Role-playing dimensions.** `dim_date` serves as booking, travel start/end and cancellation date. `dim_location` serves as origin and destination. Lead time (search date to travel date) is stored on the fact because it's a key behavioural measure.
 6. **"Previous five searches" and "past reservations" are app features, not warehouse features.** They're served from the operational database or a cache. The warehouse keeps the full history for analytics. In the lakehouse, raw click events land in bronze, are cleaned and sessionised in silver, and this star is the gold layer.
@@ -71,8 +71,8 @@ erDiagram
 
 Both are in [`sql/02_analytics_queries.sql`](sql/02_analytics_queries.sql) and were tested against synthetic data.
 
-- **A. Search-to-booking conversion by business line and month, registered vs. guest.** Conversion is the core health metric for a travel site. This query shows which line loses the most demand, and whether registered users convert better than guests. That second point puts a number on the value of pushing registration.
-- **B. Unmet demand by destination.** This finds destinations with many searches but low conversion. Those are supply or pricing gaps, where adding hotel inventory, airline partners or better prices pays off fastest.
+- **A. Search-to-booking conversion by business line and month, registered vs. guest.** Conversion is the core health metric for a travel site. Each booking is credited to the search that produced it (`search_id`), and both are grouped by the search date, so a September search that books in October is a September conversion. A search counts as converted once, however many items it led to. The query shows which line loses the most demand, and whether registered users convert better than guests.
+- **B. Unmet demand by destination.** This finds destinations with many searches but low conversion. Unconverted searches are an estimate of unmet demand, not proof of missing supply: price, sold-out dates, abandoned sessions and bookings made elsewhere all lower conversion. It shows where to look first for inventory, partner or pricing gaps.
 
 ## Year-over-year booking growth by business line
 
@@ -93,7 +93,7 @@ Definition choices, each documented in the file:
 - `NULLIF` avoids divide-by-zero.
 - A year x line spine means a year with zero bookings doesn't make `LAG` compare against the wrong year.
 
-The query also returns value (USD) growth.
+Booking volume growth is the answer to the question; the query also returns value (USD) growth as a secondary measure.
 
 ### Sample output (synthetic data)
 
@@ -109,17 +109,18 @@ The test asserts this ordering (Hotel > Flight > 0 > Car) and that each line's f
 
 ## Scaling: what breaks first if bookings spike overnight?
 
-**First, check whether the spike is real.** A sudden overnight jump is more often a bug than a business event: duplicate events from an app release, a retry storm, or bot traffic. Volume anomaly checks (today vs. trailing median, by line) should stop gold from publishing until someone confirms. Deduping on the natural key (`booking_item_id`) makes reloads safe.
+**First, check whether the spike is real.** A sudden overnight jump is more often a bug than a business event: duplicate events from an app release, a retry storm, or bot traffic. A volume check (today vs. trailing median, by line) should hold gold back from publishing until someone confirms. Deduplicating on the natural key (`booking_item_id`) makes reloads safe.
 
-**If it's real, the first thing to break is the incremental load into `fact_booking_item`, specifically the dimension key lookups and the MERGE:**
+**If it's real, the pressure shows up in this order:**
 
-- Every guest booking can create a new `dim_customer` row, so the customer dimension grows as fast as the fact. The surrogate-key lookup join (and SCD2 change detection) against an ever-larger dimension becomes the slowest step, and the nightly batch misses its window.
-- A MERGE into an unpartitioned fact rewrites or scans far more data than the new day's rows.
-- Late-arriving dimension rows (a booking before its customer or hotel record arrives) fail lookups or land as unknowns more often.
+1. **Ingestion throughput.** The nightly batch has more to read and land than its window allows, and a backlog builds. Everything downstream is late.
+2. **Incremental fact loading.** A MERGE into an unpartitioned `fact_booking_item` scans or rewrites far more than the new day's rows, and concurrent writers to the same table contend.
+3. **Dimension lookups and SCD Type 2.** Every guest booking can add a `dim_customer` row, so the dimension grows as fast as the fact. The surrogate-key lookup and SCD2 change detection slow down, and late-arriving customers or hotels land as unknowns more often.
+4. **Downstream reporting.** Dashboards querying the raw fact slow down as it grows.
 
-**Fixes, in order:**
+**Fixes, matched to each:**
 
-1. Partition or cluster `fact_booking_item` by `booking_date` (Delta liquid clustering or Snowflake clustering keys), and MERGE only the affected partitions using a watermark on `_loaded_at`.
-2. Use deterministic hash keys (e.g. `sha2(customer_nk)`) instead of sequence surrogates, so facts no longer wait on dimension lookups. Insert "inferred" dimension members for late arrivals and fill them in later.
-3. Move from a nightly batch to micro-batch or streaming ingestion (Event Hubs/Kafka → Auto Loader / Structured Streaming) so each run handles small increments. Autoscale the cluster.
+1. Move from a nightly batch to micro-batch or streaming ingestion (Event Hubs/Kafka → Auto Loader / Structured Streaming) so each run handles a small increment, and autoscale compute.
+2. Cluster `fact_booking_item` by `booking_date` (Delta liquid clustering) and MERGE only the affected dates, using a watermark on `_loaded_at`. Use one writer per table per run.
+3. Use deterministic hash keys (e.g. `sha2(customer_nk)`) so facts don't wait on a lookup, and insert inferred members for late arrivals. Hash keys do not remove SCD2: the dimension still needs effective dates to tell customer versions apart, so the fact join uses the key plus the booking time (or a version key resolved in a separate step).
 4. Pre-aggregate daily summary tables for dashboards so BI load doesn't grow with the raw fact.

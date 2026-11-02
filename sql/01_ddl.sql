@@ -11,6 +11,14 @@
 --
 -- Unknown / not-applicable members use surrogate key -1 so fact FKs are
 -- never NULL (keeps joins inner and BI tools happy).
+--
+-- On Databricks (Delta), the same tables become:
+--   * CREATE TABLE ... USING DELTA, in a Unity Catalog schema (e.g. gold.)
+--   * surrogate keys as BIGINT GENERATED ALWAYS AS IDENTITY (or hash keys)
+--   * CLUSTER BY (booking_date_key) / (search_date_key) on the facts
+--   * PRIMARY KEY / FOREIGN KEY kept as informational constraints
+--     (Delta does not enforce them; the load and tests do)
+-- Tested here in DuckDB on dummy data so it runs without a workspace.
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -43,15 +51,20 @@ CREATE TABLE dim_business_line (
 );
 
 -- Customers: registered users AND guest checkouts.
--- Guests have no account, so they are keyed on a hashed email/phone so the
--- same guest can be recognised across bookings and later stitched to an
--- account if they register. SCD Type 2 keeps history (e.g. guest -> registered).
+-- Guests have no account, so they are keyed on a token derived from their
+-- email (keyed HMAC-SHA256 with a secret held outside the warehouse, or a
+-- tokenization service). A plain hash is not enough: emails are guessable,
+-- so a plain hash can be reversed by hashing candidate emails. The token lets
+-- the same guest be recognised across bookings and stitched to an account if
+-- they register. SCD Type 2 keeps history (e.g. guest -> registered).
+-- Matching only works when an email (or another reliable identifier) is
+-- captured; searches with no identity map to the -1 Anonymous member.
 CREATE TABLE dim_customer (
     customer_key        BIGINT PRIMARY KEY,   -- surrogate
-    customer_nk         VARCHAR NOT NULL,     -- user_id for registered, 'G:'||email_hash for guests
+    customer_nk         VARCHAR NOT NULL,     -- user_id for registered, 'G:'||email_token for guests
     customer_type       VARCHAR NOT NULL,     -- Registered / Guest / Anonymous
     user_id             VARCHAR,              -- NULL for guests
-    email_hash          VARCHAR,              -- SHA-256 of normalised email (no raw PII in the warehouse)
+    email_hash          VARCHAR,              -- keyed HMAC-SHA256 of normalised email (no raw PII in the warehouse)
     home_city           VARCHAR,
     home_country        VARCHAR,
     registration_date   DATE,

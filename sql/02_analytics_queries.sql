@@ -9,57 +9,58 @@
 -- Why: conversion is the core health metric for a travel site. It shows
 -- which line leaks the most demand, and whether registered users convert
 -- better than guests (which sizes the value of pushing registration).
+--
+-- Attribution: each booking is credited to the search that produced it
+-- (fact_booking_item.search_id), and everything is grouped by the SEARCH
+-- date, so a search in September that books in October counts as a
+-- September conversion. A search counts as converted once, however many
+-- items it led to. Bookings with no attributed search are left out here.
 -- ---------------------------------------------------------------------
 WITH searches AS (
     SELECT
+        fs.search_id,
         d.year,
         d.month,
         bl.business_line,
-        CASE WHEN c.customer_type = 'Registered' THEN 'Registered' ELSE 'Guest/Anonymous' END AS customer_segment,
-        COUNT(*)                     AS searches,
-        COUNT(DISTINCT fs.session_id) AS search_sessions
+        CASE WHEN c.customer_type = 'Registered' THEN 'Registered' ELSE 'Guest/Anonymous' END AS customer_segment
     FROM fact_search fs
     JOIN dim_date          d  ON d.date_key           = fs.search_date_key
     JOIN dim_business_line bl ON bl.business_line_key = fs.business_line_key
     JOIN dim_customer      c  ON c.customer_key       = fs.customer_key
-    GROUP BY 1, 2, 3, 4
 ),
-bookings AS (
+search_outcomes AS (           -- one row per search that led to a (net) booking
     SELECT
-        d.year,
-        d.month,
-        bl.business_line,
-        CASE WHEN c.customer_type = 'Registered' THEN 'Registered' ELSE 'Guest/Anonymous' END AS customer_segment,
-        COUNT(*)                                   AS booked_items,
-        COUNT(fb.search_id)                        AS attributed_bookings,   -- bookings we can tie to a search
-        SUM(fb.total_amount_usd)                   AS gross_bookings_usd
+        fb.search_id,
+        COUNT(*)                 AS booked_items,
+        SUM(fb.total_amount_usd) AS gross_bookings_usd
     FROM fact_booking_item fb
-    JOIN dim_date          d  ON d.date_key           = fb.booking_date_key
-    JOIN dim_business_line bl ON bl.business_line_key = fb.business_line_key
-    JOIN dim_customer      c  ON c.customer_key       = fb.customer_key
     WHERE fb.booking_status <> 'Cancelled'
-    GROUP BY 1, 2, 3, 4
+      AND fb.search_id IS NOT NULL
+    GROUP BY fb.search_id
 )
 SELECT
     s.year,
     s.month,
     s.business_line,
     s.customer_segment,
-    s.searches,
-    COALESCE(b.booked_items, 0)                                          AS booked_items,
-    ROUND(100.0 * COALESCE(b.attributed_bookings, 0) / NULLIF(s.searches, 0), 2) AS search_conversion_pct,
-    ROUND(COALESCE(b.gross_bookings_usd, 0), 2)                          AS gross_bookings_usd,
-    ROUND(COALESCE(b.gross_bookings_usd, 0) / NULLIF(s.searches, 0), 2)  AS revenue_per_search_usd
+    COUNT(*)                                                          AS searches,
+    COUNT(DISTINCT o.search_id)                                       AS converted_searches,
+    ROUND(100.0 * COUNT(DISTINCT o.search_id) / COUNT(*), 2)          AS search_conversion_pct,
+    CAST(COALESCE(SUM(o.booked_items), 0) AS BIGINT)                  AS booked_items,
+    ROUND(COALESCE(SUM(o.gross_bookings_usd), 0), 2)                  AS gross_bookings_usd,
+    ROUND(COALESCE(SUM(o.gross_bookings_usd), 0) / COUNT(*), 2)       AS revenue_per_search_usd
 FROM searches s
-LEFT JOIN bookings b
-       ON  b.year = s.year AND b.month = s.month
-       AND b.business_line = s.business_line
-       AND b.customer_segment = s.customer_segment
+LEFT JOIN search_outcomes o ON o.search_id = s.search_id
+GROUP BY s.year, s.month, s.business_line, s.customer_segment
 ORDER BY s.year, s.month, s.business_line, s.customer_segment;
 
 
 -- ---------------------------------------------------------------------
 -- Query B: Unmet demand - top destinations people search for but don't book.
+--
+-- Unconverted searches are an ESTIMATE of unmet demand, not proof of missing
+-- supply: price, sold-out dates, abandoned sessions and bookings made
+-- elsewhere all lower conversion. Use it to decide where to look first.
 --
 -- Why: a destination with lots of searches and a low conversion rate is a
 -- supply or pricing gap (no inventory, prices too high, bad results). This
